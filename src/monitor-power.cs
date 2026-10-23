@@ -19,12 +19,12 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("Monitor Power")]
 [assembly: AssemblyDescription("DDC/CI monitor power controller (GUI + CLI)")]
 [assembly: AssemblyProduct("monitor-power")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.2.1.0")]
+[assembly: AssemblyFileVersion("1.2.1.0")]
 
 static class AppInfo
 {
-    public const string Version = "1.2.0";
+    public const string Version = "1.2.1";
     public const string RepoUrl = "https://github.com/IDShallow/monitor-power";
     public const string ReleasesUrl = RepoUrl + "/releases";
     public const string LatestUrl = RepoUrl + "/releases/latest/download/latest.json";
@@ -401,6 +401,7 @@ static class Ddc
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
 
     static List<MonInfo> enumTarget;
+    static bool enumQueryDdc = true;
     static readonly object enumLock = new object();
 
     // The EDID sits in HKLM\...\Enum\DISPLAY\<vendor>\<instance>\Device Parameters
@@ -495,7 +496,10 @@ static class Ddc
             m.Device = devName;
             m.Vendor = vendor;
             m.EdidModel = edidName;
-            string ddcName = ModelOf(m.Handle, null);
+            // the DDC capabilities request blocks for a moment per panel (and for
+            // seconds on a dead one), so callers that need a fast refresh ask for
+            // the EDID name only and upgrade it later on a worker thread
+            string ddcName = enumQueryDdc ? ModelOf(m.Handle, null) : null;
             m.Model = !string.IsNullOrEmpty(ddcName) ? ddcName
                     : (!string.IsNullOrEmpty(edidName) ? edidName : arr[i].szPhysicalMonitorDescription);
             m.Left = rect.left; m.Top = rect.top; m.Right = rect.right; m.Bottom = rect.bottom;
@@ -519,21 +523,66 @@ static class Ddc
     // Each call owns its own list (the main window and the board enumerate
     // independently); the previous shared static list let one window destroy
     // the other window's monitor handles.
-    public static List<MonInfo> Enumerate()
+    public static List<MonInfo> Enumerate() { return Enumerate(true); }
+
+    // queryDdcName=false: EDID-only names, fast (no DDC round trip per panel)
+    public static List<MonInfo> Enumerate(bool queryDdcName)
     {
         lock (enumLock)
         {
             List<MonInfo> result = new List<MonInfo>();
             enumTarget = result;
+            enumQueryDdc = queryDdcName;
             try
             {
                 MonitorEnumProc proc = new MonitorEnumProc(OnMonitor);
                 EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, proc, IntPtr.Zero);
                 GC.KeepAlive(proc);
             }
-            finally { enumTarget = null; }
+            finally { enumTarget = null; enumQueryDdc = true; }
             return result;
         }
+    }
+
+    // A panel switched off with its own power button (or re-plugged) comes back with
+    // a new physical-monitor handle; the old one never answers again. Match the fresh
+    // enumeration against the list we hold and swap handles in place.
+    public static int Rebind(List<MonInfo> fresh, List<MonInfo> current)
+    {
+        int matched = 0;
+        foreach (MonInfo f in fresh)
+        {
+            bool used = false;
+            foreach (MonInfo c in current)
+            {
+                if (c.Device == f.Device && c.Left == f.Left && c.Top == f.Top &&
+                    c.Right == f.Right && c.Bottom == f.Bottom && c.EdidModel == f.EdidModel)
+                {
+                    if (c.Handle != f.Handle)
+                    {
+                        Destroy(c.Handle);
+                        c.Handle = f.Handle;
+                    }
+                    used = true;
+                    matched++;
+                    break;
+                }
+            }
+            if (!used) Destroy(f.Handle);
+        }
+        return matched;
+    }
+
+    public static string Signature(List<MonInfo> list)
+    {
+        StringBuilder sb = new StringBuilder();
+        foreach (MonInfo m in list)
+        {
+            sb.Append(m.Device).Append('|')
+              .Append(m.Left).Append(',').Append(m.Top).Append(',').Append(m.Right).Append(',').Append(m.Bottom).Append('|')
+              .Append(m.Vendor).Append('|').Append(m.EdidModel).Append(';');
+        }
+        return sb.ToString();
     }
 
     // DDC calls run on a worker thread: SetVCPFeature against a panel whose I2C
@@ -647,6 +696,7 @@ static class Ddc
 class Card : Panel
 {
     public MonInfo M;
+    public Label TitleLabel;
     public Label StateLabel;
     public Label DetailLabel;
     public Button BOn, BOff, BSoft;
@@ -662,12 +712,12 @@ class Card : Panel
         BackColor = Theme.Bg2;
         BorderStyle = BorderStyle.None;
 
-        Label title = new Label();
-        title.Text = "[" + m.Index + "] " + m.Model;
-        title.Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold);
-        title.ForeColor = Theme.Text;
-        title.AutoSize = true;
-        title.Location = new Point(14, 10);
+        TitleLabel = new Label();
+        TitleLabel.Text = "[" + m.Index + "] " + m.Model;
+        TitleLabel.Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold);
+        TitleLabel.ForeColor = Theme.Text;
+        TitleLabel.AutoSize = true;
+        TitleLabel.Location = new Point(14, 10);
 
         DetailLabel = new Label();
         DetailLabel.Text = BaseDetail(m);
@@ -694,7 +744,7 @@ class Card : Panel
         BSoft.Name = "soft_" + m.Index;
         BSoft.Click += onSoft;
 
-        Controls.Add(title);
+        Controls.Add(TitleLabel);
         Controls.Add(DetailLabel);
         Controls.Add(StateLabel);
         Controls.Add(BOn);
@@ -727,6 +777,11 @@ class Card : Panel
     {
         base.OnResize(e);
         LayoutButtons();
+    }
+
+    public void SetTitle(string model)
+    {
+        if (TitleLabel != null) TitleLabel.Text = "[" + M.Index + "] " + model;
     }
 
     public void SetState(string raw, bool busy)
@@ -1244,29 +1299,50 @@ class MainForm : Form
     void Reload()
     {
         foreach (MonInfo m in monitors) Ddc.Destroy(m.Handle);
-        monitors = Ddc.Enumerate();
+        monitors = Ddc.Enumerate(false);          // EDID only: instant, no DDC stall
         BuildCards();
-        currentSig = Signature(monitors);
+        currentSig = Ddc.Signature(monitors);
         header.Text = "共 " + monitors.Count + " 块显示器";
         Log("已枚举 " + monitors.Count + " 块显示器");
         if (monitors.Count == 0) Log("没有找到显示器");
         RefreshCycle(false, false);
+        UpgradeNamesAsync();
+    }
+
+    // Fill in the DDC model strings on a worker thread and update the card titles,
+    // so opening the window never waits for a DDC round trip.
+    void UpgradeNamesAsync()
+    {
+        ThreadPool.QueueUserWorkItem(delegate(object st)
+        {
+            List<MonInfo> fresh;
+            try { fresh = Ddc.Enumerate(true); }
+            catch { return; }
+            InvokeSync(delegate
+            {
+                foreach (MonInfo f in fresh)
+                {
+                    foreach (Card c in cardList)
+                    {
+                        if (c.M.Device == f.Device && c.M.Left == f.Left && c.M.Top == f.Top &&
+                            c.M.Right == f.Right && c.M.Bottom == f.Bottom)
+                        {
+                            if (!string.IsNullOrEmpty(f.Model) && f.Model != c.M.Model)
+                            {
+                                c.M.Model = f.Model;
+                                c.SetTitle(f.Model);
+                            }
+                            break;
+                        }
+                    }
+                }
+                foreach (MonInfo f in fresh) Ddc.Destroy(f.Handle);
+            });
+        });
     }
 
     // Cards are rebuilt only when the monitor set / layout / EDID actually changed,
     // so a periodic re-enumeration does not make the window flicker.
-    static string Signature(List<MonInfo> list)
-    {
-        StringBuilder sb = new StringBuilder();
-        foreach (MonInfo m in list)
-        {
-            sb.Append(m.Device).Append('|')
-              .Append(m.Left).Append(',').Append(m.Top).Append(',').Append(m.Right).Append(',').Append(m.Bottom).Append('|')
-              .Append(m.Vendor).Append('|').Append(m.EdidModel).Append(';');
-        }
-        return sb.ToString();
-    }
-
     void BuildCards()
     {
         cards.SuspendLayout();
@@ -1297,10 +1373,11 @@ class MainForm : Form
         foreach (MonInfo m in monitors) Ddc.Destroy(m.Handle);
         monitors = fresh;
         BuildCards();
-        currentSig = Signature(monitors);
+        currentSig = Ddc.Signature(monitors);
         header.Text = "共 " + monitors.Count + " 块显示器";
         Log("显示器列表已更新：共 " + monitors.Count + " 块");
         if (monitors.Count == 0) Log("没有找到显示器");
+        UpgradeNamesAsync();
     }
 
     void UpdateWidths()
@@ -1440,8 +1517,8 @@ class MainForm : Form
             {
                 if (reenumerate)
                 {
-                    List<MonInfo> fresh = Ddc.Enumerate();
-                    string sig = Signature(fresh);
+                    List<MonInfo> fresh = Ddc.Enumerate(false);   // EDID only, no DDC stall
+                    string sig = Ddc.Signature(fresh);
                     if (sig != currentSig)
                     {
                         // debounce: a new monitor set only replaces the cards after it
@@ -1465,7 +1542,11 @@ class MainForm : Form
                     {
                         pendingSig = null;
                         pendingCount = 0;
-                        foreach (MonInfo m in fresh) Ddc.Destroy(m.Handle);
+                        // same set of panels: adopt the fresh handles, so a panel that was
+                        // switched off by its own power button starts answering again
+                        List<MonInfo> cur = new List<MonInfo>();
+                        lock (cardLock) { foreach (Card c in cardList) cur.Add(c.M); }
+                        Ddc.Rebind(fresh, cur);
                     }
                 }
                 Card[] snapshot;
@@ -1539,7 +1620,7 @@ class BoardRow : Panel
         Dot.ForeColor = Theme.Dim;
 
         NameLabel = new Label();
-        NameLabel.Text = m.Model;
+        NameLabel.Text = m.Model + "   " + (m.Device ?? "").Replace("\\\\.\\", "");
         NameLabel.AutoSize = false;
         NameLabel.Height = 18;
         NameLabel.Location = new Point(20, 5);
@@ -1580,12 +1661,15 @@ class BoardForm : Form
     Panel bar;
     ComboBox intervalBox;
     CheckBox topBox;
-    Button btnPick, btnClose;
+    Button btnPick;
     System.Windows.Forms.Timer timer;
     List<MonInfo> mons = new List<MonInfo>();
     List<BoardRow> rows = new List<BoardRow>();
     HashSet<string> shown = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     bool busy;
+    int tick;
+    string pendingSig;
+    int pendingCount;
     string cfgPath;
 
     public BoardForm()
@@ -1636,14 +1720,6 @@ class BoardForm : Form
         btnPick.Click += delegate { ToggleSettings(); };
         bar.Controls.Add(btnPick);
 
-        btnClose = new Button();
-        btnClose.Text = "×";
-        btnClose.Bounds = new Rectangle(126, 2, 24, 22);
-        Theme.Button(btnClose);
-        btnClose.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        btnClose.Click += delegate { Close(); };
-        bar.Controls.Add(btnClose);
-        bar.Resize += delegate { btnClose.Left = bar.Width - btnClose.Width - 4; };
 
         settingsPanel = new Panel();
         settingsPanel.Dock = DockStyle.Top;
@@ -1674,7 +1750,7 @@ class BoardForm : Form
 
         timer = new System.Windows.Forms.Timer();
         timer.Interval = 2000;
-        timer.Tick += delegate { ReadStates(); };
+        timer.Tick += delegate { tick++; if (tick % 6 == 0) Reenumerate(); ReadStates(); };
 
         Load += delegate
         {
@@ -1709,15 +1785,33 @@ class BoardForm : Form
         SaveConfig();
     }
 
+    // Enumeration runs off the UI thread: the DDC model lookup (and a dead panel)
+    // can block for a second or more, which made the window feel frozen when opened.
     void Rebuild()
     {
+        ThreadPool.QueueUserWorkItem(delegate(object st)
+        {
+            List<MonInfo> fresh;
+            try { fresh = Ddc.Enumerate(false); }
+            catch { return; }
+            try
+            {
+                if (!IsDisposed) Invoke((MethodInvoker)delegate { ApplyMonitors(fresh); });
+                else foreach (MonInfo m in fresh) Ddc.Destroy(m.Handle);
+            }
+            catch { foreach (MonInfo m in fresh) Ddc.Destroy(m.Handle); }
+        });
+    }
+
+    void ApplyMonitors(List<MonInfo> fresh)
+    {
         foreach (MonInfo m in mons) Ddc.Destroy(m.Handle);
-        mons = Ddc.Enumerate();
+        mons = fresh;
         checksPanel.Controls.Clear();
         foreach (MonInfo m in mons)
         {
             CheckBox cb = new CheckBox();
-            cb.Text = m.Model + "   " + (m.Device ?? "");
+            cb.Text = m.Model + "   " + (m.Device ?? "").Replace("\\\\.\\", "");
             cb.AutoSize = true;
             cb.ForeColor = Theme.Text;
             cb.BackColor = Theme.Bg2;
@@ -1727,6 +1821,45 @@ class BoardForm : Form
             checksPanel.Controls.Add(cb);
         }
         Recollect();
+    }
+
+    // Called every few ticks: a panel switched off by its own power button comes back
+    // with a new physical-monitor handle, the old one stops answering for good.
+    void Reenumerate()
+    {
+        if (busy) return;
+        busy = true;
+        ThreadPool.QueueUserWorkItem(delegate(object st)
+        {
+            try
+            {
+                List<MonInfo> fresh = Ddc.Enumerate(false);
+                string sig = Ddc.Signature(fresh);
+                List<MonInfo> cur = new List<MonInfo>(mons);
+                if (sig == Ddc.Signature(cur))
+                {
+                    Ddc.Rebind(fresh, cur);          // rows hold the same MonInfo objects
+                }
+                else
+                {
+                    if (sig == pendingSig) pendingCount++;
+                    else { pendingSig = sig; pendingCount = 1; }
+                    if (pendingCount >= 2)
+                    {
+                        pendingSig = null;
+                        pendingCount = 0;
+                        if (!IsDisposed) Invoke((MethodInvoker)delegate { ApplyMonitors(fresh); });
+                        else foreach (MonInfo m in fresh) Ddc.Destroy(m.Handle);
+                    }
+                    else
+                    {
+                        foreach (MonInfo m in fresh) Ddc.Destroy(m.Handle);
+                    }
+                }
+            }
+            catch { }
+            finally { busy = false; }
+        });
     }
 
     void Recollect()
