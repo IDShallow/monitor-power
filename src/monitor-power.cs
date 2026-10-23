@@ -4,18 +4,271 @@
 // Build: src\build.cmd   (Framework csc, C# 5 / .NET 4.x, /target:winexe /codepage:65001)
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
+using System.IO;
+using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 [assembly: AssemblyTitle("Monitor Power")]
 [assembly: AssemblyDescription("DDC/CI monitor power controller (GUI + CLI)")]
 [assembly: AssemblyProduct("monitor-power")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+
+static class AppInfo
+{
+    public const string Version = "1.1.0";
+    public const string RepoUrl = "https://github.com/IDShallow/monitor-power";
+    public const string ReleasesUrl = RepoUrl + "/releases";
+    public const string LatestUrl = RepoUrl + "/releases/latest/download/latest.json";
+}
+
+static class Autostart
+{
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string ValueName = "MonitorPower";
+
+    public static bool IsEnabled()
+    {
+        try
+        {
+            using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey, false))
+            {
+                if (k == null) return false;
+                return k.GetValue(ValueName) != null;
+            }
+        }
+        catch { return false; }
+    }
+
+    public static bool Set(bool on)
+    {
+        try
+        {
+            using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey, true) ?? Registry.CurrentUser.CreateSubKey(RunKey))
+            {
+                if (k == null) return false;
+                if (on) k.SetValue(ValueName, "\"" + Application.ExecutablePath + "\"");
+                else k.DeleteValue(ValueName, false);
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+}
+
+// Dark, flat theme in the spirit of the ai-traffic-light app.
+static class Theme
+{
+    public static readonly Color Bg = Color.FromArgb(30, 30, 30);
+    public static readonly Color Bg2 = Color.FromArgb(38, 38, 38);
+    public static readonly Color Bg3 = Color.FromArgb(46, 46, 46);
+    public static readonly Color Line = Color.FromArgb(60, 60, 60);
+    public static readonly Color Text = Color.FromArgb(235, 235, 235);
+    public static readonly Color Dim = Color.FromArgb(155, 155, 155);
+    public static readonly Color Green = Color.FromArgb(76, 196, 106);
+    public static readonly Color Blue = Color.FromArgb(90, 169, 230);
+    public static readonly Color Red = Color.FromArgb(224, 93, 93);
+    public static readonly Color Amber = Color.FromArgb(240, 180, 60);
+
+    public static void Button(Button b)
+    {
+        b.FlatStyle = FlatStyle.Flat;
+        b.BackColor = Bg3;
+        b.ForeColor = Text;
+        b.FlatAppearance.BorderColor = Line;
+        b.FlatAppearance.MouseOverBackColor = Color.FromArgb(60, 60, 60);
+        b.FlatAppearance.MouseDownBackColor = Color.FromArgb(72, 72, 72);
+    }
+
+    public static void Link(LinkLabel l)
+    {
+        l.LinkColor = Blue;
+        l.ActiveLinkColor = Color.FromArgb(140, 200, 245);
+        l.VisitedLinkColor = Blue;
+        l.LinkBehavior = LinkBehavior.HoverUnderline;
+    }
+}
+
+// Dark title bar (Windows 10 1809+): same look as the ai-traffic-light app.
+static class DarkTitle
+{
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+    public static void Apply(Form f)
+    {
+        try
+        {
+            int on = 1;
+            if (DwmSetWindowAttribute(f.Handle, 20, ref on, 4) != 0)
+                DwmSetWindowAttribute(f.Handle, 19, ref on, 4);
+        }
+        catch { }
+    }
+}
+
+class UpdateInfo
+{    public string Version;
+    public string Url;
+    public string Sha256;
+    public string Notes;
+    public bool Mandatory;
+}
+
+// Update manifest = latest.json attached to the newest GitHub release:
+//   { "version":"1.1.0", "url":".../monitor-power.exe", "sha256":"...",
+//     "notes":"...", "mandatory":false }
+static class UpdateCheck
+{
+    public static UpdateInfo Fetch()
+    {
+        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+        HttpWebRequest req = (HttpWebRequest)WebRequest.Create(AppInfo.LatestUrl);
+        req.UserAgent = "monitor-power/" + AppInfo.Version;
+        req.Timeout = 8000;
+        req.ReadWriteTimeout = 8000;
+        req.AutomaticDecompression = DecompressionMethods.GZip;
+        using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+        using (Stream s = resp.GetResponseStream())
+        using (StreamReader sr = new StreamReader(s, Encoding.UTF8))
+        {
+            string json = sr.ReadToEnd();
+            UpdateInfo info = new UpdateInfo();
+            info.Version = StrField(json, "version");
+            info.Url = StrField(json, "url");
+            info.Sha256 = StrField(json, "sha256");
+            info.Notes = StrField(json, "notes");
+            info.Mandatory = BoolField(json, "mandatory");
+            if (string.IsNullOrEmpty(info.Version) || string.IsNullOrEmpty(info.Url)) return null;
+            return info;
+        }
+    }
+
+    static string StrField(string json, string key)
+    {
+        string pat = "\"" + key + "\"";
+        int i = json.IndexOf(pat, StringComparison.OrdinalIgnoreCase);
+        if (i < 0) return null;
+        i = json.IndexOf(':', i + pat.Length);
+        if (i < 0) return null;
+        i++;
+        while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
+        if (i >= json.Length || json[i] != '"') return null;
+        i++;
+        StringBuilder sb = new StringBuilder();
+        while (i < json.Length)
+        {
+            char c = json[i++];
+            if (c == '"') break;
+            if (c == '\\' && i < json.Length)
+            {
+                char e = json[i++];
+                if (e == 'n') sb.Append('\n');
+                else if (e == 't') sb.Append('\t');
+                else if (e == 'r') sb.Append('\r');
+                else if (e == 'u' && i + 4 <= json.Length)
+                {
+                    int code;
+                    if (int.TryParse(json.Substring(i, 4), System.Globalization.NumberStyles.HexNumber, null, out code)) { sb.Append((char)code); i += 4; }
+                }
+                else sb.Append(e);
+            }
+            else sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    static bool BoolField(string json, string key)
+    {
+        string pat = "\"" + key + "\"";
+        int i = json.IndexOf(pat, StringComparison.OrdinalIgnoreCase);
+        if (i < 0) return false;
+        i = json.IndexOf(':', i + pat.Length);
+        if (i < 0) return false;
+        string rest = json.Substring(i + 1, Math.Min(10, json.Length - i - 1)).Trim();
+        return rest.StartsWith("true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static int CompareVersions(string a, string b)
+    {
+        string[] pa = (a ?? "").TrimStart('v', 'V').Split('.');
+        string[] pb = (b ?? "").TrimStart('v', 'V').Split('.');
+        int n = Math.Max(pa.Length, pb.Length);
+        for (int i = 0; i < n; i++)
+        {
+            int va = 0, vb = 0;
+            if (i < pa.Length) int.TryParse(pa[i], out va);
+            if (i < pb.Length) int.TryParse(pb[i], out vb);
+            if (va != vb) return va < vb ? -1 : 1;
+        }
+        return 0;
+    }
+
+    // Downloads the new exe to %TEMP%, verifies sha256, returns the local path.
+    public static string Download(UpdateInfo info, out string error)
+    {
+        error = null;
+        string path = Path.Combine(Path.GetTempPath(), "monitor-power-" + info.Version + ".exe");
+        try
+        {
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(info.Url);
+            req.UserAgent = "monitor-power/" + AppInfo.Version;
+            req.Timeout = 30000;
+            req.ReadWriteTimeout = 30000;
+            using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+            using (Stream s = resp.GetResponseStream())
+            using (FileStream fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                byte[] buf = new byte[81920];
+                int n;
+                while ((n = s.Read(buf, 0, buf.Length)) > 0) fs.Write(buf, 0, n);
+            }
+            if (!string.IsNullOrEmpty(info.Sha256))
+            {
+                string actual;
+                using (SHA256 sha = SHA256.Create())
+                using (FileStream fs = File.OpenRead(path))
+                {
+                    byte[] hash = sha.ComputeHash(fs);
+                    StringBuilder sb = new StringBuilder();
+                    foreach (byte b in hash) sb.Append(b.ToString("x2"));
+                    actual = sb.ToString();
+                }
+                if (!string.Equals(actual, info.Sha256.Trim(), StringComparison.OrdinalIgnoreCase))
+                {
+                    error = "SHA256 不匹配（下载被篡改或文件损坏）";
+                    try { File.Delete(path); } catch { }
+                    return null;
+                }
+            }
+            return path;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return null;
+        }
+    }
+
+    // The downloaded exe replaces this one: it runs with --apply-update <pid> <dst>,
+    // waits for this process to exit, copies itself over dst and starts it.
+    public static void ApplyAndExit(string newExe)
+    {
+        ProcessStartInfo psi = new ProcessStartInfo(newExe,
+            "--apply-update " + Process.GetCurrentProcess().Id + " \"" + Application.ExecutablePath + "\"");
+        psi.UseShellExecute = false;
+        Process.Start(psi);
+        Application.Exit();
+    }
+}
 
 class MonInfo
 {
@@ -318,12 +571,13 @@ class Card : Panel
         M = m;
         Height = 96;
         Margin = new Padding(6);
-        BackColor = Color.WhiteSmoke;
-        BorderStyle = BorderStyle.FixedSingle;
+        BackColor = Theme.Bg2;
+        BorderStyle = BorderStyle.None;
 
         Label title = new Label();
         title.Text = "[" + m.Index + "] " + m.Model;
         title.Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold);
+        title.ForeColor = Theme.Text;
         title.AutoSize = true;
         title.Location = new Point(14, 10);
 
@@ -332,12 +586,13 @@ class Card : Panel
         DetailLabel.AutoSize = false;
         DetailLabel.Height = 18;
         DetailLabel.AutoEllipsis = true;
-        DetailLabel.ForeColor = Color.DimGray;
+        DetailLabel.ForeColor = Theme.Dim;
         DetailLabel.Location = new Point(14, 36);
 
         StateLabel = new Label();
         StateLabel.Text = "状态: 读取中…";
         StateLabel.AutoSize = true;
+        StateLabel.ForeColor = Theme.Dim;
         StateLabel.Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold);
         StateLabel.Location = new Point(14, 62);
 
@@ -367,6 +622,7 @@ class Card : Panel
         b.Width = width;
         b.Height = 30;
         b.Top = 30;
+        Theme.Button(b);
         return b;
     }
 
@@ -387,13 +643,13 @@ class Card : Panel
 
     public void SetState(string raw, bool busy)
     {
-        if (busy) { StateLabel.Text = "状态: 执行中…"; StateLabel.ForeColor = Color.DarkOrange; return; }
+        if (busy) { StateLabel.Text = "状态: 执行中…"; StateLabel.ForeColor = Theme.Amber; return; }
         StateLabel.Text = "状态: " + Ddc.StateTextCn(raw);
-        if (raw == "1") StateLabel.ForeColor = Color.SeaGreen;
-        else if (raw == "5") StateLabel.ForeColor = Color.DimGray;
-        else if (raw == "4") StateLabel.ForeColor = Color.SteelBlue;
-        else if (Ddc.IsNumeric(raw)) StateLabel.ForeColor = Color.SteelBlue;
-        else StateLabel.ForeColor = Color.Firebrick;
+        if (raw == "1") StateLabel.ForeColor = Theme.Green;
+        else if (raw == "5") StateLabel.ForeColor = Theme.Dim;
+        else if (raw == "4") StateLabel.ForeColor = Theme.Blue;
+        else if (Ddc.IsNumeric(raw)) StateLabel.ForeColor = Theme.Blue;
+        else StateLabel.ForeColor = Theme.Red;
     }
 
     public void SetDetail(string text)
@@ -415,7 +671,14 @@ class MainForm : Form
     FlowLayoutPanel cards;
     Label header;
     TextBox logBox;
-    Button btnRefresh, btnAllOn, btnAllOff, btnBlank, btnLock;
+    Button btnRefresh, btnAllOn, btnAllOff, btnBlank, btnLock, btnBoard;
+    LinkLabel lnkUpdate, lnkStar;
+    Label lblDot, lblVersion;
+    CheckBox chkStartup;
+    bool syncingStartup;
+    BoardForm board;
+    bool updateKnown;
+    string updateVersion;
     System.Windows.Forms.Timer pollTimer;
     List<MonInfo> monitors = new List<MonInfo>();
     List<Card> cardList = new List<Card>();
@@ -429,16 +692,21 @@ class MainForm : Form
     {
         Text = "显示器电源控制器 (DDC/CI VCP 0xD6)";
         Font = new Font("Microsoft YaHei UI", 9F);
-        ClientSize = new Size(780, 560);
-        MinimumSize = new Size(700, 420);
+        BackColor = Theme.Bg;
+        ForeColor = Theme.Text;
+        ClientSize = new Size(900, 600);
+        MinimumSize = new Size(780, 460);
         StartPosition = FormStartPosition.CenterScreen;
 
         Panel top = new Panel();
         top.Dock = DockStyle.Top;
         top.Height = 52;
+        top.BackColor = Theme.Bg;
         top.Padding = new Padding(12, 10, 12, 10);
 
         header = new Label();
+        header.ForeColor = Theme.Text;
+        header.Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold);
         header.Text = "正在枚举显示器…";
         header.AutoSize = true;
         header.Location = new Point(12, 18);
@@ -461,7 +729,10 @@ class MainForm : Form
 
         btnLock = ActionButton("锁定并关屏", delegate { LockAndBlank(); });
         btnLock.Name = "btnLockOff";
+        btnBoard = ActionButton("状态看板", delegate { ShowBoard(); });
+        btnBoard.Name = "btnBoard";
 
+        actions.Controls.Add(btnBoard);
         actions.Controls.Add(btnLock);
         actions.Controls.Add(btnRefresh);
         actions.Controls.Add(btnBlank);
@@ -476,7 +747,7 @@ class MainForm : Form
         cards.WrapContents = false;
         cards.AutoScroll = true;
         cards.Padding = new Padding(8, 4, 8, 8);
-        cards.BackColor = Color.White;
+        cards.BackColor = Theme.Bg;
 
         logBox = new TextBox();
         logBox.Dock = DockStyle.Bottom;
@@ -484,12 +755,79 @@ class MainForm : Form
         logBox.Multiline = true;
         logBox.ReadOnly = true;
         logBox.ScrollBars = ScrollBars.Vertical;
-        logBox.BackColor = Color.White;
+        logBox.BackColor = Color.FromArgb(20, 20, 20);
         logBox.Font = new Font("Consolas", 9F);
-        logBox.BorderStyle = BorderStyle.FixedSingle;
+        logBox.ForeColor = Color.FromArgb(190, 190, 190);
+        logBox.BorderStyle = BorderStyle.None;
+
+        Panel footer = new Panel();
+        footer.Dock = DockStyle.Bottom;
+        footer.Height = 28;
+        footer.BackColor = Color.FromArgb(24, 24, 24);
+
+        lblVersion = new Label();
+        lblVersion.Text = "v" + AppInfo.Version;
+        lblVersion.AutoSize = true;
+        lblVersion.ForeColor = Theme.Dim;
+        lblVersion.Location = new Point(12, 6);
+
+        lnkUpdate = new LinkLabel();
+        lnkUpdate.Text = "检查更新";
+        lnkUpdate.AutoSize = true;
+        lnkUpdate.LinkColor = Theme.Blue;
+        lnkUpdate.ActiveLinkColor = Color.FromArgb(140, 200, 245);
+        lnkUpdate.VisitedLinkColor = Theme.Blue;
+        lnkUpdate.Location = new Point(66, 5);
+        lnkUpdate.LinkClicked += delegate { CheckUpdates(true); };
+
+        lblDot = new Label();
+        lblDot.Text = "●";
+        lblDot.AutoSize = true;
+        lblDot.ForeColor = Theme.Red;
+        lblDot.Location = new Point(126, 4);
+        lblDot.Visible = false;
+
+        lnkStar = new LinkLabel();
+        lnkStar.Text = "★ 给个 Star";
+        lnkStar.AutoSize = true;
+        lnkStar.LinkColor = Theme.Blue;
+        lnkStar.ActiveLinkColor = Color.FromArgb(140, 200, 245);
+        lnkStar.VisitedLinkColor = Theme.Blue;
+        lnkStar.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        lnkStar.Location = new Point(760, 5);
+        lnkStar.LinkClicked += delegate { OpenUrl(AppInfo.RepoUrl); };
+
+        chkStartup = new CheckBox();
+        chkStartup.Text = "开机自启";
+        chkStartup.AutoSize = true;
+        chkStartup.ForeColor = Theme.Dim;
+        chkStartup.Location = new Point(148, 4);
+        chkStartup.Checked = Autostart.IsEnabled();
+        chkStartup.CheckedChanged += delegate
+        {
+            if (syncingStartup) return;
+            bool ok = Autostart.Set(chkStartup.Checked);
+            if (!ok)
+            {
+                syncingStartup = true;
+                chkStartup.Checked = !chkStartup.Checked;
+                syncingStartup = false;
+                MessageBox.Show("写入开机自启注册表失败（HKCU\\...\\Run）", "monitor-power", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            Log("开机自启：" + (chkStartup.Checked ? "已开启" : "已关闭"));
+        };
+
+        footer.Controls.Add(lblVersion);
+        footer.Controls.Add(lnkUpdate);
+        footer.Controls.Add(lblDot);
+        footer.Controls.Add(chkStartup);
+        footer.Controls.Add(lnkStar);
+        footer.Resize += delegate { lnkStar.Left = footer.Width - lnkStar.Width - 12; };
 
         Controls.Add(cards);
         Controls.Add(logBox);
+        Controls.Add(footer);
         Controls.Add(top);
 
         pollTimer = new System.Windows.Forms.Timer();
@@ -498,9 +836,28 @@ class MainForm : Form
 
         Load += delegate
         {
+            DarkTitle.Apply(this);
             try { Reload(); }
             catch (Exception ex) { Entry.CrashLog(ex, "Load/Reload"); MessageBox.Show(ex.ToString(), "monitor-power"); }
             pollTimer.Start();
+            lnkStar.Left = footer.Width - lnkStar.Width - 12;
+
+            // quiet update check on startup (does not block the UI)
+            ThreadPool.QueueUserWorkItem(delegate(object st)
+            {
+                Thread.Sleep(1500);
+                UpdateInfo info = null;
+                try { info = UpdateCheck.Fetch(); } catch { }
+                if (info == null) return;
+                bool newer = UpdateCheck.CompareVersions(info.Version, AppInfo.Version) > 0;
+                UI(delegate
+                {
+                    updateKnown = newer;
+                    updateVersion = info.Version;
+                    lblDot.Visible = newer;
+                    if (newer) Log("发现新版本 v" + info.Version + "（点左下角「检查更新」查看/安装）");
+                });
+            });
         };
         FormClosing += delegate { pollTimer.Stop(); foreach (MonInfo m in monitors) Ddc.Destroy(m.Handle); };
     }
@@ -513,6 +870,7 @@ class MainForm : Form
         b.Height = 30;
         b.Margin = new Padding(6, 0, 0, 0);
         b.Click += h;
+        Theme.Button(b);
         return b;
     }
 
@@ -525,6 +883,147 @@ class MainForm : Form
             return;
         }
         logBox.AppendText("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + line + Environment.NewLine);
+    }
+
+    static void OpenUrl(string url)
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo(url);
+            psi.UseShellExecute = true;
+            Process.Start(psi);
+        }
+        catch { }
+    }
+
+    void ShowBoard()
+    {
+        if (board == null || board.IsDisposed)
+        {
+            board = new BoardForm();
+            board.FormClosed += delegate { board = null; };
+            board.Show(this);
+        }
+        else
+        {
+            if (board.WindowState == FormWindowState.Minimized) board.WindowState = FormWindowState.Normal;
+            board.Activate();
+            board.BringToFront();
+        }
+    }
+
+    void CheckUpdates(bool manual)
+    {
+        Log("正在检查更新…");
+        ThreadPool.QueueUserWorkItem(delegate(object st)
+        {
+            UpdateInfo info = null;
+            string err = null;
+            try { info = UpdateCheck.Fetch(); }
+            catch (Exception ex) { err = ex.Message; }
+            UI(delegate
+            {
+                if (info == null)
+                {
+                    Log("检查更新失败：" + (err ?? "无法读取 latest.json"));
+                    if (manual)
+                        MessageBox.Show("检查更新失败：" + (err ?? "无法读取 latest.json") + "\r\n\r\n可手动打开发布页：" + AppInfo.ReleasesUrl,
+                            "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                bool newer = UpdateCheck.CompareVersions(info.Version, AppInfo.Version) > 0;
+                updateKnown = newer;
+                updateVersion = info.Version;
+                lblDot.Visible = newer;
+                if (newer)
+                {
+                    Log("发现新版本 v" + info.Version + "（当前 v" + AppInfo.Version + "）");
+                    ShowUpdateDialog(info);
+                }
+                else
+                {
+                    Log("已是最新版本 v" + AppInfo.Version);
+                    if (manual) MessageBox.Show("已是最新版本 v" + AppInfo.Version + "。", "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            });
+        });
+    }
+
+    void ShowUpdateDialog(UpdateInfo info)
+    {
+        using (Form dlg = new Form())
+        {
+            dlg.Text = "发现新版本 v" + info.Version;
+            dlg.ClientSize = new Size(480, 300);
+            dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+            dlg.MaximizeBox = false;
+            dlg.MinimizeBox = false;
+            dlg.StartPosition = FormStartPosition.CenterParent;
+            dlg.Font = Font;
+
+            Label tip = new Label();
+            tip.Text = "当前 v" + AppInfo.Version + "  →  最新 v" + info.Version + (info.Mandatory ? "（重要更新）" : "");
+            tip.AutoSize = true;
+            tip.Location = new Point(14, 12);
+
+            TextBox notes = new TextBox();
+            notes.Multiline = true;
+            notes.ReadOnly = true;
+            notes.ScrollBars = ScrollBars.Vertical;
+            notes.Bounds = new Rectangle(14, 38, 452, 190);
+            notes.Text = string.IsNullOrEmpty(info.Notes) ? "（该版本没有附更新说明）" : info.Notes;
+
+            Button ok = new Button();
+            ok.Text = "立即更新";
+            ok.Bounds = new Rectangle(232, 244, 100, 30);
+            ok.DialogResult = DialogResult.OK;
+
+            Button page = new Button();
+            page.Text = "打开发布页";
+            page.Bounds = new Rectangle(340, 244, 126, 30);
+            page.Click += delegate { OpenUrl(AppInfo.ReleasesUrl); };
+
+            Button cancel = new Button();
+            cancel.Text = "稍后";
+            cancel.Bounds = new Rectangle(140, 244, 84, 30);
+            cancel.DialogResult = DialogResult.Cancel;
+
+            dlg.Controls.Add(tip);
+            dlg.Controls.Add(notes);
+            dlg.Controls.Add(ok);
+            dlg.Controls.Add(page);
+            dlg.Controls.Add(cancel);
+            dlg.AcceptButton = ok;
+            dlg.CancelButton = cancel;
+
+            if (dlg.ShowDialog(this) == DialogResult.OK) DoUpdate(info);
+        }
+    }
+
+    void DoUpdate(UpdateInfo info)
+    {
+        Log("开始下载 v" + info.Version + " …");
+        ThreadPool.QueueUserWorkItem(delegate(object st)
+        {
+            string err;
+            string file = UpdateCheck.Download(info, out err);
+            if (file == null)
+            {
+                UI(delegate
+                {
+                    Log("下载失败：" + err);
+                    MessageBox.Show("下载失败：" + err, "更新", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                });
+                return;
+            }
+            UI(delegate
+            {
+                Log("下载完成并通过校验：" + file);
+                if (MessageBox.Show("将关闭本程序，替换为 v" + info.Version + " 并重新启动。继续？", "更新",
+                        MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+                UpdateCheck.ApplyAndExit(file);
+            });
+        });
     }
 
     void Reload()
@@ -776,15 +1275,332 @@ class MainForm : Form
     }
 }
 
+// ---------------------------------------------------------------- board (dashboard)
+
+class BoardRow : Panel
+{
+    public MonInfo M;
+    public Label Dot;
+    public Label NameLabel;
+    public Label State;
+
+    public BoardRow(MonInfo m)
+    {
+        M = m;
+        Height = 26;
+        BackColor = Theme.Bg2;
+
+        Dot = new Label();
+        Dot.Text = "●";
+        Dot.AutoSize = true;
+        Dot.Font = new Font("Microsoft YaHei UI", 9F);
+        Dot.Location = new Point(4, 4);
+        Dot.ForeColor = Theme.Dim;
+
+        NameLabel = new Label();
+        NameLabel.Text = m.Model;
+        NameLabel.AutoSize = false;
+        NameLabel.Height = 18;
+        NameLabel.Location = new Point(20, 5);
+        NameLabel.ForeColor = Theme.Text;
+        NameLabel.AutoEllipsis = true;
+
+        State = new Label();
+        State.AutoSize = false;
+        State.Height = 18;
+        State.Width = 56;
+        State.TextAlign = ContentAlignment.MiddleRight;
+        State.Location = new Point(150, 5);
+        State.ForeColor = Theme.Dim;
+        State.Font = new Font("Microsoft YaHei UI", 8.5F);
+        State.Text = "…";
+
+        Controls.Add(Dot);
+        Controls.Add(NameLabel);
+        Controls.Add(State);
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (State == null || NameLabel == null) return;
+        State.Left = Width - State.Width - 6;
+        NameLabel.Width = Math.Max(30, State.Left - NameLabel.Left - 4);
+    }
+}
+
+class BoardForm : Form
+{
+    static readonly int[] INTERVALS = new int[] { 1, 2, 5, 10 };
+
+    FlowLayoutPanel rowsPanel;
+    FlowLayoutPanel checksPanel;
+    Panel settingsPanel;
+    Panel bar;
+    ComboBox intervalBox;
+    CheckBox topBox;
+    Button btnPick, btnClose;
+    System.Windows.Forms.Timer timer;
+    List<MonInfo> mons = new List<MonInfo>();
+    List<BoardRow> rows = new List<BoardRow>();
+    HashSet<string> shown = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    bool busy;
+    string cfgPath;
+
+    public BoardForm()
+    {
+        Text = "显示器看板";
+        Font = new Font("Microsoft YaHei UI", 9F);
+        FormBorderStyle = FormBorderStyle.SizableToolWindow;
+        BackColor = Theme.Bg;
+        ForeColor = Theme.Text;
+        ClientSize = new Size(258, 128);
+        MinimumSize = new Size(220, 90);
+        TopMost = true;
+        StartPosition = FormStartPosition.Manual;
+        Location = new Point(80, 80);
+
+        cfgPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                               "monitor-power", "board.ini");
+
+        bar = new Panel();
+        bar.Dock = DockStyle.Bottom;
+        bar.Height = 26;
+        bar.BackColor = Color.FromArgb(24, 24, 24);
+
+        intervalBox = new ComboBox();
+        intervalBox.DropDownStyle = ComboBoxStyle.DropDownList;
+        intervalBox.Items.AddRange(new object[] { "1s", "2s", "5s", "10s" });
+        intervalBox.SelectedIndex = 1;
+        intervalBox.Bounds = new Rectangle(4, 2, 50, 22);
+        intervalBox.SelectedIndexChanged += delegate { ApplyInterval(); };
+        intervalBox.FlatStyle = FlatStyle.Flat;
+        intervalBox.BackColor = Theme.Bg3;
+        intervalBox.ForeColor = Theme.Text;
+        bar.Controls.Add(intervalBox);
+
+        topBox = new CheckBox();
+        topBox.Text = "顶";
+        topBox.AutoSize = true;
+        topBox.ForeColor = Theme.Dim;
+        topBox.Checked = true;
+        topBox.Location = new Point(58, 4);
+        topBox.CheckedChanged += delegate { TopMost = topBox.Checked; SaveConfig(); };
+        bar.Controls.Add(topBox);
+
+        btnPick = new Button();
+        btnPick.Text = "屏";
+        btnPick.Bounds = new Rectangle(92, 2, 30, 22);
+        Theme.Button(btnPick);
+        btnPick.Click += delegate { ToggleSettings(); };
+        bar.Controls.Add(btnPick);
+
+        btnClose = new Button();
+        btnClose.Text = "×";
+        btnClose.Bounds = new Rectangle(126, 2, 24, 22);
+        Theme.Button(btnClose);
+        btnClose.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        btnClose.Click += delegate { Close(); };
+        bar.Controls.Add(btnClose);
+        bar.Resize += delegate { btnClose.Left = bar.Width - btnClose.Width - 4; };
+
+        settingsPanel = new Panel();
+        settingsPanel.Dock = DockStyle.Top;
+        settingsPanel.Height = 0;
+        settingsPanel.Visible = false;
+        settingsPanel.BackColor = Theme.Bg2;
+
+        checksPanel = new FlowLayoutPanel();
+        checksPanel.Dock = DockStyle.Fill;
+        checksPanel.FlowDirection = FlowDirection.TopDown;
+        checksPanel.WrapContents = false;
+        checksPanel.AutoScroll = true;
+        checksPanel.Padding = new Padding(8, 4, 8, 4);
+        checksPanel.BackColor = Theme.Bg2;
+        settingsPanel.Controls.Add(checksPanel);
+
+        rowsPanel = new FlowLayoutPanel();
+        rowsPanel.Dock = DockStyle.Fill;
+        rowsPanel.FlowDirection = FlowDirection.TopDown;
+        rowsPanel.WrapContents = false;
+        rowsPanel.AutoScroll = true;
+        rowsPanel.BackColor = Theme.Bg;
+        rowsPanel.Padding = new Padding(4);
+
+        Controls.Add(rowsPanel);
+        Controls.Add(settingsPanel);
+        Controls.Add(bar);
+
+        timer = new System.Windows.Forms.Timer();
+        timer.Interval = 2000;
+        timer.Tick += delegate { ReadStates(); };
+
+        Load += delegate
+        {
+            DarkTitle.Apply(this);
+            LoadConfig();
+            Rebuild();
+            timer.Start();
+        };
+        FormClosing += delegate
+        {
+            timer.Stop();
+            SaveConfig();
+            foreach (MonInfo m in mons) Ddc.Destroy(m.Handle);
+        };
+        rowsPanel.Resize += delegate
+        {
+            foreach (BoardRow r in rows) r.Width = Math.Max(160, rowsPanel.ClientSize.Width - 12);
+        };
+    }
+
+    void ToggleSettings()
+    {
+        settingsPanel.Visible = !settingsPanel.Visible;
+        settingsPanel.Height = settingsPanel.Visible ? 104 : 0;
+    }
+
+    void ApplyInterval()
+    {
+        int idx = intervalBox.SelectedIndex;
+        if (idx < 0 || idx >= INTERVALS.Length) idx = 1;
+        timer.Interval = INTERVALS[idx] * 1000;
+        SaveConfig();
+    }
+
+    void Rebuild()
+    {
+        foreach (MonInfo m in mons) Ddc.Destroy(m.Handle);
+        mons = Ddc.Enumerate();
+        checksPanel.Controls.Clear();
+        foreach (MonInfo m in mons)
+        {
+            CheckBox cb = new CheckBox();
+            cb.Text = m.Model + "   " + (m.Device ?? "");
+            cb.AutoSize = true;
+            cb.ForeColor = Theme.Text;
+            cb.BackColor = Theme.Bg2;
+            cb.Tag = m;
+            cb.Checked = shown.Count == 0 || shown.Contains(m.Device ?? "");
+            cb.CheckedChanged += delegate { Recollect(); };
+            checksPanel.Controls.Add(cb);
+        }
+        Recollect();
+    }
+
+    void Recollect()
+    {
+        shown.Clear();
+        rows.Clear();
+        rowsPanel.Controls.Clear();
+        foreach (Control c in checksPanel.Controls)
+        {
+            CheckBox cb = c as CheckBox;
+            if (cb == null) continue;
+            MonInfo m = (MonInfo)cb.Tag;
+            if (!cb.Checked) continue;
+            shown.Add(m.Device ?? "");
+            BoardRow r = new BoardRow(m);
+            r.Width = Math.Max(160, rowsPanel.ClientSize.Width - 12);
+            rows.Add(r);
+            rowsPanel.Controls.Add(r);
+        }
+        SaveConfig();
+        ReadStates();
+    }
+
+    void ReadStates()
+    {
+        if (busy) return;
+        busy = true;
+        BoardRow[] snap = rows.ToArray();
+        ThreadPool.QueueUserWorkItem(delegate(object st)
+        {
+            try
+            {
+                foreach (BoardRow r in snap)
+                {
+                    string raw = Ddc.Read(r.M.Handle, 2000);
+                    BoardRow rr = r;
+                    string v = raw;
+                    try
+                    {
+                        if (!IsDisposed) Invoke((MethodInvoker)delegate { UpdateRow(rr, v); });
+                    }
+                    catch { }
+                }
+            }
+            finally { busy = false; }
+        });
+    }
+
+    void UpdateRow(BoardRow r, string raw)
+    {
+        if (r.IsDisposed) return;
+        if (raw == "1") { r.Dot.ForeColor = Theme.Green; r.State.ForeColor = Theme.Green; r.State.Text = "开"; }
+        else if (raw == "4") { r.Dot.ForeColor = Theme.Blue; r.State.ForeColor = Theme.Blue; r.State.Text = "软关"; }
+        else if (raw == "5") { r.Dot.ForeColor = Theme.Dim; r.State.ForeColor = Theme.Dim; r.State.Text = "关"; }
+        else { r.Dot.ForeColor = Theme.Red; r.State.ForeColor = Theme.Red; r.State.Text = "读不到"; }
+    }
+
+    void LoadConfig()
+    {
+        try
+        {
+            if (!File.Exists(cfgPath)) return;
+            foreach (string line in File.ReadAllLines(cfgPath, Encoding.UTF8))
+            {
+                string[] kv = line.Split(new char[] { '=' }, 2);
+                if (kv.Length != 2) continue;
+                string k = kv[0].Trim();
+                string v = kv[1].Trim();
+                if (k == "interval")
+                {
+                    int sec;
+                    if (int.TryParse(v, out sec))
+                    {
+                        int idx = Array.IndexOf(INTERVALS, sec);
+                        if (idx >= 0) intervalBox.SelectedIndex = idx;
+                    }
+                }
+                else if (k == "topmost") topBox.Checked = (v == "1");
+                else if (k == "show")
+                {
+                    shown.Clear();
+                    foreach (string d in v.Split(';')) if (d.Trim().Length > 0) shown.Add(d.Trim());
+                }
+            }
+        }
+        catch { }
+    }
+
+    void SaveConfig()
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(cfgPath);
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            int idx = intervalBox.SelectedIndex;
+            int sec = (idx >= 0 && idx < INTERVALS.Length) ? INTERVALS[idx] : 2;
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("interval=" + sec);
+            sb.AppendLine("topmost=" + (topBox.Checked ? "1" : "0"));
+            sb.AppendLine("show=" + string.Join(";", new List<string>(shown).ToArray()));
+            File.WriteAllText(cfgPath, sb.ToString(), Encoding.UTF8);
+        }
+        catch { }
+    }
+}
+
 // ---------------------------------------------------------------- CLI + entry
 
 static class Cli
 {
-    const string VERSION = "1.0.0";
+
 
     public static void Usage()
     {
-        Console.WriteLine("monitor-power " + VERSION + " - DDC/CI monitor power controller (VCP 0xD6)");
+        Console.WriteLine("monitor-power " + AppInfo.Version + " - DDC/CI monitor power controller (VCP 0xD6)");
         Console.WriteLine();
         Console.WriteLine("  no arguments          open the GUI controller");
         Console.WriteLine();
@@ -799,10 +1615,10 @@ static class Cli
         Console.WriteLine("  off                 D6=4 Off(soft) + SC_MONITORPOWER; any input wakes it");
         Console.WriteLine("  offddc              D6=4 only (no OS-level blank)");
         Console.WriteLine("  forceoff            only the OS-level blank (SC_MONITORPOWER)");
-        Console.WriteLine("  lockoff             lock the desktop, wait 1s, then blank the displays");
+        Console.WriteLine("  lockoff             lock the desktop, wait 1s, then switch the displays off (D6=5)");
         Console.WriteLine("  help                this text");
         Console.WriteLine();
-        Console.WriteLine("options: --index 0,1  --wait N  --json  --force  --no-force  --version");
+        Console.WriteLine("options: --index 0,1  --wait N  --json  --force  --no-force  --version  --check-update");
         Console.WriteLine("states: 1=On 2=Standby 3=Suspend 4=Off(soft) 5=Off(hard)");
         Console.WriteLine("exit codes: 0 all good, 1 partial/failed, 2 usage error");
     }
@@ -845,13 +1661,15 @@ static class Cli
             else if (al == "--force" || al == "-force") force = true;
             else if (al == "--no-force" || al == "-no-force") noForce = true;
             else if (al == "--json" || al == "-json") json = true;
-            else if (al == "--version" || al == "-version" || al == "/version") { Console.WriteLine("monitor-power " + VERSION); return 0; }
+            else if (al == "--version" || al == "-version" || al == "/version") { Console.WriteLine("monitor-power " + AppInfo.Version); return 0; }
+            else if (al == "--check-update") cmd = "check-update";
             else if (al == "--help" || al == "-h" || al == "/?") cmd = "help";
             else if (al.StartsWith("-")) return UsageError("unknown option: " + args[i]);
             else cmd = al;
         }
 
         if (cmd == "help") { Usage(); return 0; }
+        if (cmd == "check-update") return CheckUpdateCli();
 
         List<MonInfo> mons = Ddc.Enumerate();
         if (mons.Count == 0) { Console.WriteLine("no physical monitors found"); return 1; }
@@ -894,6 +1712,23 @@ static class Cli
                    " vendor=" + (m.Vendor ?? "-") + " model=" + m.Model;
         if (!string.IsNullOrEmpty(m.EdidModel) && m.EdidModel != m.Model) s += " edid=" + m.EdidModel;
         return s;
+    }
+
+    static int CheckUpdateCli()
+    {
+        Console.WriteLine("current: " + AppInfo.Version);
+        UpdateInfo info = null;
+        try { info = UpdateCheck.Fetch(); }
+        catch (Exception ex) { Console.WriteLine("check failed: " + ex.Message); return 2; }
+        if (info == null) { Console.WriteLine("check failed: bad manifest"); return 2; }
+        Console.WriteLine("latest:  " + info.Version);
+        if (UpdateCheck.CompareVersions(info.Version, AppInfo.Version) > 0)
+        {
+            Console.WriteLine("update available: " + info.Url);
+            return 1;
+        }
+        Console.WriteLine("up to date");
+        return 0;
     }
 
     static int Status(List<MonInfo> mons, bool json)
@@ -1014,9 +1849,35 @@ static class Entry
         catch { }
     }
 
+    static int ApplyUpdate(string pidText, string dst)
+    {
+        int pid;
+        int.TryParse(pidText, out pid);
+        if (pid > 0)
+        {
+            try { Process p = Process.GetProcessById(pid); p.WaitForExit(60000); } catch { }
+        }
+        string self = Application.ExecutablePath;
+        for (int i = 0; i < 120; i++)
+        {
+            try
+            {
+                File.Copy(self, dst, true);
+                Process.Start(dst);
+                return 0;
+            }
+            catch { Thread.Sleep(500); }
+        }
+        return 1;
+    }
+
     [STAThread]
     static int Main(string[] args)
     {
+        // Self-update helper: this copy runs from %TEMP%, waits for the old process to
+        // exit, then overwrites it and starts the new one.
+        if (args.Length >= 3 && args[0] == "--apply-update") return ApplyUpdate(args[1], args[2]);
+
         if (args.Length == 0)
         {
             Application.EnableVisualStyles();

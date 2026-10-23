@@ -18,13 +18,25 @@ jobs:
         shell: cmd
         run: tools\build.cmd
 
-      - name: Checksums
+      - name: Checksums and update manifest
         shell: pwsh
         run: |
           $exe = "dist/monitor-power.exe"
           $hash = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLower()
           "$hash  monitor-power.exe" | Set-Content -Encoding ASCII -Path dist/SHA256SUMS.txt
-          Get-Content dist/SHA256SUMS.txt
+
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $url = "https://github.com/${{ github.repository }}/releases/latest/download/monitor-power.exe"
+          $notes = "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+          $manifest = [ordered]@{
+            version   = $version
+            url       = $url
+            sha256    = $hash
+            notes     = $notes
+            mandatory = $false
+          }
+          $manifest | ConvertTo-Json | Set-Content -Encoding UTF8 dist/latest.json
+          Get-Content dist/latest.json
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -33,3 +45,4 @@ jobs:
           files: |
             dist/monitor-power.exe
             dist/SHA256SUMS.txt
+            dist/latest.json
