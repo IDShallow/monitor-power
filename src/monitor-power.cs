@@ -19,12 +19,12 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("Monitor Power")]
 [assembly: AssemblyDescription("DDC/CI monitor power controller (GUI + CLI)")]
 [assembly: AssemblyProduct("monitor-power")]
-[assembly: AssemblyVersion("1.1.1.0")]
-[assembly: AssemblyFileVersion("1.1.1.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
 static class AppInfo
 {
-    public const string Version = "1.1.1";
+    public const string Version = "1.2.0";
     public const string RepoUrl = "https://github.com/IDShallow/monitor-power";
     public const string ReleasesUrl = RepoUrl + "/releases";
     public const string LatestUrl = RepoUrl + "/releases/latest/download/latest.json";
@@ -109,6 +109,57 @@ static class DarkTitle
             int on = 1;
             if (DwmSetWindowAttribute(f.Handle, 20, ref on, 4) != 0)
                 DwmSetWindowAttribute(f.Handle, 19, ref on, 4);
+        }
+        catch { }
+    }
+}
+
+// Tiny ini in %APPDATA%\monitor-power for the app-level switches.
+static class Settings
+{
+    static string FilePath
+    {
+        get
+        {
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                                "monitor-power", "settings.ini");
+        }
+    }
+
+    public static bool GetBool(string key, bool def)
+    {
+        try
+        {
+            if (!File.Exists(FilePath)) return def;
+            foreach (string line in File.ReadAllLines(FilePath, Encoding.UTF8))
+            {
+                string[] kv = line.Split(new char[] { '=' }, 2);
+                if (kv.Length == 2 && kv[0].Trim() == key) return kv[1].Trim() == "1";
+            }
+        }
+        catch { }
+        return def;
+    }
+
+    public static void SetBool(string key, bool value)
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(FilePath);
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            Dictionary<string, string> map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (File.Exists(FilePath))
+            {
+                foreach (string line in File.ReadAllLines(FilePath, Encoding.UTF8))
+                {
+                    string[] kv = line.Split(new char[] { '=' }, 2);
+                    if (kv.Length == 2) map[kv[0].Trim()] = kv[1].Trim();
+                }
+            }
+            map[key] = value ? "1" : "0";
+            StringBuilder sb = new StringBuilder();
+            foreach (KeyValuePair<string, string> p in map) sb.AppendLine(p.Key + "=" + p.Value);
+            File.WriteAllText(FilePath, sb.ToString(), Encoding.UTF8);
         }
         catch { }
     }
@@ -712,6 +763,9 @@ class MainForm : Form
     LinkLabel lnkUpdate, lnkStar;
     Label lblDot, lblVersion;
     CheckBox chkStartup;
+    CheckBox chkTray;
+    NotifyIcon tray;
+    bool reallyExit;
     bool syncingStartup;
     BoardForm board;
     bool updateKnown;
@@ -857,11 +911,47 @@ class MainForm : Form
             Log("开机自启：" + (chkStartup.Checked ? "已开启" : "已关闭"));
         };
 
+        chkTray = new CheckBox();
+        chkTray.Text = "关闭到托盘";
+        chkTray.AutoSize = true;
+        chkTray.ForeColor = Theme.Dim;
+        chkTray.Location = new Point(226, 4);
+        chkTray.Checked = Settings.GetBool("closeToTray", true);
+        chkTray.CheckedChanged += delegate
+        {
+            Settings.SetBool("closeToTray", chkTray.Checked);
+            Log("关闭窗口时：" + (chkTray.Checked ? "收进托盘" : "退出程序"));
+        };
+
         footer.Controls.Add(lblVersion);
         footer.Controls.Add(lnkUpdate);
         footer.Controls.Add(lblDot);
         footer.Controls.Add(chkStartup);
+        footer.Controls.Add(chkTray);
         footer.Controls.Add(lnkStar);
+
+        tray = new NotifyIcon();
+        try { tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+        catch { }
+        if (tray.Icon == null) tray.Icon = SystemIcons.Application;
+        tray.Text = "显示器电源控制器";
+
+        ContextMenuStrip menu = new ContextMenuStrip();
+        menu.Items.Add("打开主界面", null, delegate { RestoreFromTray(); });
+        menu.Items.Add("状态看板", null, delegate { ShowBoard(); });
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("全部开机", null, delegate { RunAll("全部开机", 1); });
+        menu.Items.Add("全部关机", null, delegate { RunAll("全部关机", 5); });
+        menu.Items.Add(new ToolStripSeparator());
+        ToolStripMenuItem miStart = new ToolStripMenuItem("开机自启");
+        miStart.Click += delegate { chkStartup.Checked = !chkStartup.Checked; };
+        menu.Opening += delegate { miStart.Checked = Autostart.IsEnabled(); };
+        menu.Items.Add(miStart);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("退出", null, delegate { reallyExit = true; Close(); });
+        tray.ContextMenuStrip = menu;
+        tray.DoubleClick += delegate { RestoreFromTray(); };
+        tray.Visible = true;
         footer.Resize += delegate { lnkStar.Left = footer.Width - lnkStar.Width - 12; };
 
         Controls.Add(cards);
@@ -898,11 +988,26 @@ class MainForm : Form
                 });
             });
         };
-        FormClosing += delegate
+        FormClosing += delegate(object s, FormClosingEventArgs e)
         {
+            // "close to tray": a normal close only hides the window; the tray menu's
+            // 退出 sets reallyExit, Windows shutdown always closes for real
+            if (!reallyExit && e.CloseReason == CloseReason.UserClosing && chkTray.Checked)
+            {
+                e.Cancel = true;
+                Hide();
+                try { tray.ShowBalloonTip(1500, "显示器电源控制器", "已收进托盘，双击图标打开", ToolTipIcon.Info); }
+                catch { }
+                return;
+            }
             pollTimer.Stop();
             if (board != null && !board.IsDisposed) board.Close();
             foreach (MonInfo m in monitors) Ddc.Destroy(m.Handle);
+        };
+        FormClosed += delegate
+        {
+            tray.Visible = false;
+            tray.Dispose();
         };
     }
 
@@ -938,6 +1043,14 @@ class MainForm : Form
             Process.Start(psi);
         }
         catch { }
+    }
+
+    void RestoreFromTray()
+    {
+        Show();
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+        Activate();
+        BringToFront();
     }
 
     void ShowBoard()
