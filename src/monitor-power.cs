@@ -630,9 +630,10 @@ class MainForm : Form
             string note = "";
             if (fallback)
             {
-                // nobody answers DDC/CI on this panel: fall back to the OS-level paths
+                // nobody answers DDC/CI on this panel
                 if (value == 1) { Ddc.NudgeInput(); note = "这块屏 DDC/CI 不通，已发送唤醒输入（不保证点亮）"; }
-                else { Ddc.ForceOff(); note = "这块屏 DDC/CI 不通，已改用系统级熄灭：所有显示器一起灭，动鼠标通常能亮回来；若熄灭很久后不亮，用「开机」或物理电源键"; }
+                else if (value == 4) { Ddc.ForceOff(); note = "这块屏 DDC/CI 不通，已改用系统级熄灭：所有显示器一起灭，动鼠标通常能亮回来"; }
+                else { note = "这块屏 DDC/CI 不通，未执行关机（电源键语义不会退回系统级熄灭）"; }
             }
             else if (value == 4) Ddc.ForceOff();   // soft-off only sticks with the OS blank
             UI(delegate
@@ -665,12 +666,15 @@ class MainForm : Form
                 UI(delegate { cc.SetState(aa, false); cc.SetDetail(rr == "OK" ? "" : ("写入失败: " + rr)); });
                 Log("[" + c.M.Index + "] " + name + " → 写入 " + r + "，当前 " + Ddc.StateTextCn(after));
             }
-            if (value == 4 || (failed > 0 && value != 1)) Ddc.ForceOff();
+            // 电源键语义（D6=5）绝不退回 SC_MONITORPOWER：那属于软关，动鼠标就会亮
+            if (value == 4) Ddc.ForceOff();
             if (failed > 0 && value == 1) Ddc.NudgeInput();
             UI(delegate
             {
-                if (failed > 0 && value != 1)
-                    Log("有 " + failed + " 块屏 DDC/CI 不通，已追加系统级熄灭（所有屏一起灭，动鼠标通常能亮回来；熄灭很久后可能要用「开机」或物理电源键）；可在显示器 OSD 里打开 DDC/CI 后重试");
+                if (failed > 0 && value == 5)
+                    Log("有 " + failed + " 块屏 DDC/CI 不通，未执行关机（不会退回系统级熄灭）；可在显示器 OSD 里打开 DDC/CI 后重试");
+                else if (failed > 0 && value == 4)
+                    Log("有 " + failed + " 块屏 DDC/CI 不通，已追加系统级熄灭（所有屏一起灭，动鼠标通常能亮回来）；可在显示器 OSD 里打开 DDC/CI 后重试");
                 else if (failed > 0)
                     Log("有 " + failed + " 块屏 DDC/CI 不通，已发送唤醒输入；可在显示器 OSD 里打开 DDC/CI 后重试");
                 SetBusy(false);
@@ -679,16 +683,15 @@ class MainForm : Form
         });
     }
 
-    // One click: lock the session, then (after 1s) blank the panels.
-    // D6=4 + the OS-level blank is used on purpose instead of D6=5: a hard-off panel
-    // does not come back on the next key press, and the user has to type a password
-    // to unlock - they would be staring at a dark screen.
+    // One click: lock the session, then (after 1s) switch the panels off with the
+    // power-button semantic (D6=5). Deliberately NOT D6=4 + SC_MONITORPOWER - that
+    // is a soft off that the next mouse move undoes.
     void LockAndBlank()
     {
         if (acting) { Log("正在执行上一个操作，请稍候"); return; }
         SetBusy(true);
         bool locked = Ddc.LockDesktop();
-        Log((locked ? "已锁定桌面" : "锁定桌面失败（可能不是交互式会话）") + "，1 秒后关闭显示器…");
+        Log((locked ? "已锁定桌面" : "锁定桌面失败（可能不是交互式会话）") + "，1 秒后关闭显示器电源…");
         ThreadPool.QueueUserWorkItem(delegate(object state)
         {
             Thread.Sleep(1000);
@@ -697,13 +700,14 @@ class MainForm : Form
             int failed = 0;
             foreach (Card c in snap)
             {
-                string r = Ddc.Write(c.M.Handle, 4, 5000);
+                string r = Ddc.Write(c.M.Handle, 5, 5000);
                 if (r != "OK") failed++;
             }
-            Ddc.ForceOff();
+            // no SC_MONITORPOWER fallback: a soft off is undone by the next input
             UI(delegate
             {
-                Log("显示器已关闭" + (failed > 0 ? "（" + failed + " 块屏 DDC 不通，已用系统级熄灭兜底）" : "") + "；回来动鼠标或按键即可唤醒");
+                Log("显示器已按电源键语义关闭" + (failed > 0 ? "（" + failed + " 块屏 DDC/CI 不通，未处理）" : "") +
+                    "；唤醒请按显示器电源键，或解锁后运行 monitor-power.exe poweron");
                 SetBusy(false);
                 RefreshCycle(false, true);
             });
@@ -953,14 +957,13 @@ static class Cli
         int failed = 0;
         for (int i = 0; i < mons.Count; i++)
         {
-            string r = Ddc.Write(mons[i].Handle, 4, 5000);
+            string r = Ddc.Write(mons[i].Handle, 5, 5000);   // power-button semantic, no soft off
             if (r != "OK") failed++;
         }
-        Ddc.ForceOff();
-        Console.WriteLine("displays off (D6=4 + SC_MONITORPOWER); the next mouse/keyboard input wakes them");
+        Console.WriteLine("displays off (D6=5); press the monitor power button or run 'poweron' to wake");
         if (failed > 0)
         {
-            Console.WriteLine("  note: " + failed + " monitor(s) did not answer DDC/CI - covered by the OS-level blank");
+            Console.WriteLine("  note: " + failed + " monitor(s) did not answer DDC/CI - left alone (no SC_MONITORPOWER fallback)");
             return 1;
         }
         return 0;
