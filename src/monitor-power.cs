@@ -19,12 +19,12 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("Monitor Power")]
 [assembly: AssemblyDescription("DDC/CI monitor power controller (GUI + CLI)")]
 [assembly: AssemblyProduct("monitor-power")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.1.1.0")]
+[assembly: AssemblyFileVersion("1.1.1.0")]
 
 static class AppInfo
 {
-    public const string Version = "1.1.0";
+    public const string Version = "1.1.1";
     public const string RepoUrl = "https://github.com/IDShallow/monitor-power";
     public const string ReleasesUrl = RepoUrl + "/releases";
     public const string LatestUrl = RepoUrl + "/releases/latest/download/latest.json";
@@ -129,11 +129,23 @@ static class UpdateCheck
 {
     public static UpdateInfo Fetch()
     {
+        Exception last = null;
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try { return FetchOnce(); }
+            catch (Exception ex) { last = ex; Thread.Sleep(700); }
+        }
+        throw last;
+    }
+
+    static UpdateInfo FetchOnce()
+    {
         ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
         HttpWebRequest req = (HttpWebRequest)WebRequest.Create(AppInfo.LatestUrl);
         req.UserAgent = "monitor-power/" + AppInfo.Version;
-        req.Timeout = 8000;
-        req.ReadWriteTimeout = 8000;
+        req.Timeout = 12000;
+        req.ReadWriteTimeout = 12000;
+        req.Proxy = null;                       // go direct; a stale WinINET proxy breaks this
         req.AutomaticDecompression = DecompressionMethods.GZip;
         using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
         using (Stream s = resp.GetResponseStream())
@@ -337,8 +349,8 @@ static class Ddc
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevices(string dev, uint i, ref DISPLAY_DEVICE dd, uint flags);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
 
-    static List<MonInfo> mons = new List<MonInfo>();
-    static MonitorEnumProc keepAlive;
+    static List<MonInfo> enumTarget;
+    static readonly object enumLock = new object();
 
     // The EDID sits in HKLM\...\Enum\DISPLAY\<vendor>\<instance>\Device Parameters
     // and is readable even when the panel does not answer DDC/CI at all, so the
@@ -436,18 +448,41 @@ static class Ddc
             m.Model = !string.IsNullOrEmpty(ddcName) ? ddcName
                     : (!string.IsNullOrEmpty(edidName) ? edidName : arr[i].szPhysicalMonitorDescription);
             m.Left = rect.left; m.Top = rect.top; m.Right = rect.right; m.Bottom = rect.bottom;
-            m.Index = mons.Count;
-            mons.Add(m);
+
+            // drivers occasionally report the same panel twice in one pass - keep the first
+            bool dup = false;
+            foreach (MonInfo e in enumTarget)
+            {
+                if (e.Device == m.Device && e.Left == m.Left && e.Top == m.Top &&
+                    e.Right == m.Right && e.Bottom == m.Bottom && e.EdidModel == m.EdidModel)
+                { dup = true; break; }
+            }
+            if (dup) { DestroyPhysicalMonitor(m.Handle); continue; }
+
+            m.Index = enumTarget.Count;
+            enumTarget.Add(m);
         }
         return true;
     }
 
+    // Each call owns its own list (the main window and the board enumerate
+    // independently); the previous shared static list let one window destroy
+    // the other window's monitor handles.
     public static List<MonInfo> Enumerate()
     {
-        mons = new List<MonInfo>();
-        keepAlive = new MonitorEnumProc(OnMonitor);
-        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, keepAlive, IntPtr.Zero);
-        return mons;
+        lock (enumLock)
+        {
+            List<MonInfo> result = new List<MonInfo>();
+            enumTarget = result;
+            try
+            {
+                MonitorEnumProc proc = new MonitorEnumProc(OnMonitor);
+                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, proc, IntPtr.Zero);
+                GC.KeepAlive(proc);
+            }
+            finally { enumTarget = null; }
+            return result;
+        }
     }
 
     // DDC calls run on a worker thread: SetVCPFeature against a panel whose I2C
@@ -565,6 +600,8 @@ class Card : Panel
     public Label DetailLabel;
     public Button BOn, BOff, BSoft;
     public bool Hinted;      // DDC warning already written to the log for this card
+    public int FailStreak;   // consecutive unreadable polls
+    public string LastGood;  // last readable D6 value
 
     public Card(MonInfo m, EventHandler onOn, EventHandler onOff, EventHandler onSoft)
     {
@@ -684,6 +721,8 @@ class MainForm : Form
     List<Card> cardList = new List<Card>();
     readonly object cardLock = new object();
     string currentSig = "";
+    string pendingSig;
+    int pendingCount;
     int tick;
     bool polling;
     bool acting;
@@ -859,7 +898,12 @@ class MainForm : Form
                 });
             });
         };
-        FormClosing += delegate { pollTimer.Stop(); foreach (MonInfo m in monitors) Ddc.Destroy(m.Handle); };
+        FormClosing += delegate
+        {
+            pollTimer.Stop();
+            if (board != null && !board.IsDisposed) board.Close();
+            foreach (MonInfo m in monitors) Ddc.Destroy(m.Handle);
+        };
     }
 
     static Button ActionButton(string text, EventHandler h)
@@ -902,7 +946,8 @@ class MainForm : Form
         {
             board = new BoardForm();
             board.FormClosed += delegate { board = null; };
-            board.Show(this);
+            // no owner window: an owned form is hidden together with the main window
+            board.Show();
         }
         else
         {
@@ -925,10 +970,9 @@ class MainForm : Form
             {
                 if (info == null)
                 {
-                    Log("检查更新失败：" + (err ?? "无法读取 latest.json"));
-                    if (manual)
-                        MessageBox.Show("检查更新失败：" + (err ?? "无法读取 latest.json") + "\r\n\r\n可手动打开发布页：" + AppInfo.ReleasesUrl,
-                            "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    string msg = err ?? "无法读取 latest.json";
+                    Log("检查更新失败：" + msg);
+                    if (manual) ShowUpdateError(msg);
                     return;
                 }
                 bool newer = UpdateCheck.CompareVersions(info.Version, AppInfo.Version) > 0;
@@ -949,6 +993,54 @@ class MainForm : Form
         });
     }
 
+    void ShowUpdateError(string msg)
+    {
+        using (Form dlg = new Form())
+        {
+            dlg.Text = "检查更新失败";
+            dlg.ClientSize = new Size(460, 176);
+            dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+            dlg.MaximizeBox = false;
+            dlg.MinimizeBox = false;
+            dlg.StartPosition = FormStartPosition.CenterParent;
+            dlg.Font = Font;
+            dlg.BackColor = Theme.Bg;
+            dlg.ForeColor = Theme.Text;
+
+            Label tip = new Label();
+            tip.AutoSize = false;
+            tip.Bounds = new Rectangle(14, 14, 432, 78);
+            tip.ForeColor = Theme.Text;
+            tip.Text = "连不上 GitHub（网络原因）：\r\n" + msg;
+
+            Button retry = new Button();
+            retry.Text = "重试";
+            retry.Bounds = new Rectangle(160, 120, 90, 30);
+            retry.DialogResult = DialogResult.Retry;
+            Theme.Button(retry);
+
+            Button page = new Button();
+            page.Text = "打开发布页";
+            page.Bounds = new Rectangle(258, 120, 112, 30);
+            page.Click += delegate { OpenUrl(AppInfo.ReleasesUrl); };
+            Theme.Button(page);
+
+            Button close = new Button();
+            close.Text = "关闭";
+            close.Bounds = new Rectangle(378, 120, 68, 30);
+            close.DialogResult = DialogResult.Cancel;
+            Theme.Button(close);
+
+            dlg.Controls.Add(tip);
+            dlg.Controls.Add(retry);
+            dlg.Controls.Add(page);
+            dlg.Controls.Add(close);
+            dlg.CancelButton = close;
+
+            if (dlg.ShowDialog(this) == DialogResult.Retry) CheckUpdates(true);
+        }
+    }
+
     void ShowUpdateDialog(UpdateInfo info)
     {
         using (Form dlg = new Form())
@@ -960,9 +1052,13 @@ class MainForm : Form
             dlg.MinimizeBox = false;
             dlg.StartPosition = FormStartPosition.CenterParent;
             dlg.Font = Font;
+            dlg.BackColor = Theme.Bg;
+            dlg.ForeColor = Theme.Text;
+            dlg.Load += delegate { DarkTitle.Apply(dlg); };
 
             Label tip = new Label();
             tip.Text = "当前 v" + AppInfo.Version + "  →  最新 v" + info.Version + (info.Mandatory ? "（重要更新）" : "");
+            tip.ForeColor = Theme.Text;
             tip.AutoSize = true;
             tip.Location = new Point(14, 12);
 
@@ -971,22 +1067,28 @@ class MainForm : Form
             notes.ReadOnly = true;
             notes.ScrollBars = ScrollBars.Vertical;
             notes.Bounds = new Rectangle(14, 38, 452, 190);
+            notes.BackColor = Color.FromArgb(20, 20, 20);
+            notes.ForeColor = Color.FromArgb(200, 200, 200);
+            notes.BorderStyle = BorderStyle.None;
             notes.Text = string.IsNullOrEmpty(info.Notes) ? "（该版本没有附更新说明）" : info.Notes;
 
             Button ok = new Button();
             ok.Text = "立即更新";
             ok.Bounds = new Rectangle(232, 244, 100, 30);
             ok.DialogResult = DialogResult.OK;
+            Theme.Button(ok);
 
             Button page = new Button();
             page.Text = "打开发布页";
             page.Bounds = new Rectangle(340, 244, 126, 30);
             page.Click += delegate { OpenUrl(AppInfo.ReleasesUrl); };
+            Theme.Button(page);
 
             Button cancel = new Button();
             cancel.Text = "稍后";
             cancel.Bounds = new Rectangle(140, 244, 84, 30);
             cancel.DialogResult = DialogResult.Cancel;
+            Theme.Button(cancel);
 
             dlg.Controls.Add(tip);
             dlg.Controls.Add(notes);
@@ -1226,13 +1328,30 @@ class MainForm : Form
                 if (reenumerate)
                 {
                     List<MonInfo> fresh = Ddc.Enumerate();
-                    if (Signature(fresh) != currentSig)
+                    string sig = Signature(fresh);
+                    if (sig != currentSig)
                     {
-                        List<MonInfo> give = fresh;
-                        InvokeSync(delegate { ApplyMonitors(give); });
+                        // debounce: a new monitor set only replaces the cards after it
+                        // survived two scans, so a momentarily attached virtual display
+                        // (or a re-plug blip) does not rebuild the whole window
+                        if (sig == pendingSig) pendingCount++;
+                        else { pendingSig = sig; pendingCount = 1; }
+                        if (pendingCount >= 2)
+                        {
+                            List<MonInfo> give = fresh;
+                            InvokeSync(delegate { ApplyMonitors(give); });
+                            pendingSig = null;
+                            pendingCount = 0;
+                        }
+                        else
+                        {
+                            foreach (MonInfo m in fresh) Ddc.Destroy(m.Handle);
+                        }
                     }
                     else
                     {
+                        pendingSig = null;
+                        pendingCount = 0;
                         foreach (MonInfo m in fresh) Ddc.Destroy(m.Handle);
                     }
                 }
@@ -1244,9 +1363,16 @@ class MainForm : Form
                     Card cc = c; string rr = raw;
                     InvokeSync(delegate
                     {
-                        cc.SetState(rr, false);
-                        cc.SetDetail(Ddc.IsNumeric(rr) ? "" : ("DDC/CI: " + rr));
-                        if (!cc.Hinted && !Ddc.IsNumeric(rr))
+                        bool ok = Ddc.IsNumeric(rr);
+                        if (ok) { cc.LastGood = rr; cc.FailStreak = 0; }
+                        else cc.FailStreak++;
+                        // keep showing the last good state for the first couple of misses;
+                        // DDC occasionally drops a single reply, that is not "unreachable"
+                        bool unknown = !ok && (cc.FailStreak >= 3 || cc.LastGood == null);
+                        string show = unknown ? rr : (ok ? rr : cc.LastGood);
+                        cc.SetState(show, false);
+                        cc.SetDetail(unknown ? ("DDC/CI: " + rr) : "");
+                        if (unknown && !cc.Hinted)
                         {
                             cc.Hinted = true;
                             Log("[" + cc.M.Index + "] " + cc.M.Model + " 的 DDC/CI 无应答：无法精确开关这块屏，按钮会退化为「系统级熄灭 / 唤醒输入」。常见原因是走 VGA/转接头（多数只转发 EDID、不转发 DDC/CI），或 OSD 里关了 DDC/CI；改接 HDMI/DP/DVI 直连后点刷新即可。");
@@ -1283,6 +1409,8 @@ class BoardRow : Panel
     public Label Dot;
     public Label NameLabel;
     public Label State;
+    public int FailStreak;
+    public string LastGood;
 
     public BoardRow(MonInfo m)
     {
@@ -1537,9 +1665,14 @@ class BoardForm : Form
     void UpdateRow(BoardRow r, string raw)
     {
         if (r.IsDisposed) return;
-        if (raw == "1") { r.Dot.ForeColor = Theme.Green; r.State.ForeColor = Theme.Green; r.State.Text = "开"; }
-        else if (raw == "4") { r.Dot.ForeColor = Theme.Blue; r.State.ForeColor = Theme.Blue; r.State.Text = "软关"; }
-        else if (raw == "5") { r.Dot.ForeColor = Theme.Dim; r.State.ForeColor = Theme.Dim; r.State.Text = "关"; }
+        bool ok = Ddc.IsNumeric(raw);
+        if (ok) { r.LastGood = raw; r.FailStreak = 0; }
+        else r.FailStreak++;
+        bool unknown = !ok && (r.FailStreak >= 3 || r.LastGood == null);
+        string v = unknown ? raw : (ok ? raw : r.LastGood);
+        if (v == "1") { r.Dot.ForeColor = Theme.Green; r.State.ForeColor = Theme.Green; r.State.Text = "开"; }
+        else if (v == "4") { r.Dot.ForeColor = Theme.Blue; r.State.ForeColor = Theme.Blue; r.State.Text = "软关"; }
+        else if (v == "5") { r.Dot.ForeColor = Theme.Dim; r.State.ForeColor = Theme.Dim; r.State.Text = "关"; }
         else { r.Dot.ForeColor = Theme.Red; r.State.ForeColor = Theme.Red; r.State.Text = "读不到"; }
     }
 
