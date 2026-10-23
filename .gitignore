@@ -1,0 +1,16 @@
+# Build output
+dist/
+
+# Visual Studio / Rider
+.vs/
+bin/
+obj/
+*.user
+*.suo
+
+# Runtime crash log (written next to the exe)
+monitor-power-error.log
+
+# OS
+Thumbs.db
+Desktop.ini

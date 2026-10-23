@@ -1,0 +1,31 @@
+name: Bug report / 问题反馈
+description: 报告一个可复现的问题
+labels: [ bug ]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量附上 `monitor-power.exe status` 的输出——里面有型号、输出接口和 `D6` 值，
+        能快速定位是「面板不答 DDC/CI」还是程序本身的问题。
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 期望的结果 vs 实际的结果
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: monitor-power.exe status 输出
+      render: text
+  - type: input
+    id: monitor
+    attributes:
+      label: 显示器型号与连接方式
+      placeholder: Dell SE2422H / HDMI 直连
+  - type: input
+    id: version
+    attributes:
+      label: 程序版本
+      placeholder: v1.0.0
